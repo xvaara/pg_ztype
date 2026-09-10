@@ -40,10 +40,24 @@ rows saves little. The rest of this document says where the line is.
 
 PostgreSQL compresses large values in TOAST with pglz or lz4, and that is the
 whole menu: the method is not extensible, and values that fit in a row,
-roughly anything under 2 kB, are never compressed at all. pg_ztype adds three
-types that compress their own bytes with
-[zstd](https://facebook.github.io/zstd/), optionally with a trained
-dictionary, and otherwise behave like `text`, `jsonb` and `bytea`.
+roughly anything under 2 kB, are never compressed at all. That line is
+`TOAST_TUPLE_THRESHOLD`, a compile-time constant; the `toast_tuple_target`
+storage parameter decides how far a row is shrunk once it is past the line
+and cannot lower it. The suite pins this: a table of 1,000 jsonb rows of
+about 540 bytes with `toast_tuple_target = 128` and lz4 holds zero compressed
+values and is byte for byte the size of the same table at the default,
+while 3 kB rows in the same table compress. pg_ztype adds three types that
+compress their own bytes with [zstd](https://facebook.github.io/zstd/),
+optionally with a trained dictionary, and otherwise behave like `text`,
+`jsonb` and `bytea`.
+
+Ordering is the one thing the types leave to the cast, on purpose. Sorting,
+`min`/`max` or `DISTINCT` inside an aggregate on the compressed column itself
+is rare (a row is ordered by a key or a timestamp, not by its 5 kB body),
+and where it is wanted `ORDER BY body::text` is also the faster form: a
+comparison on the compressed type would decode two values, a sort on the
+cast decodes each row once. Equality, `GROUP BY`, hash joins and expression
+or GIN indexes work on the column directly.
 
 ```sql
 CREATE EXTENSION ztype;

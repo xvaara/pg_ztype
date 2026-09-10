@@ -317,6 +317,7 @@ def check(cluster, work):
         parameter_shapes(a)
         input_hygiene(a)
         plain_reads(a)
+        toast_threshold(a)
         out = a.query("SELECT (decode('00','hex')::ztext)::text;", error='storage format')
         assert 'spike' not in out, out  # the hint names no project-internal history
         a.query("SELECT raw_length(decode('00','hex')::ztext);", error='storage format')
@@ -459,6 +460,25 @@ def plain_reads(a):
         a.query(sql, error=missing)
     a.query('DROP TABLE plain_reads;')
     print('PASS: plain reads and literal comparisons need no cast; base-type functions do', flush=True)
+
+
+def toast_threshold(a):
+    """README "Why": TOAST compression is entered only when a row exceeds TOAST_TUPLE_THRESHOLD, a
+    compile-time constant of about 2 kB; toast_tuple_target decides how far a row is shrunk once it
+    is past that line and cannot lower the line. So the lowest target leaves a 0.5 kB jsonb row
+    uncompressed and the table the same size, while a 3 kB row does compress."""
+    a.query("CREATE TABLE toast_low (doc jsonb COMPRESSION lz4) WITH (toast_tuple_target = 128);")
+    a.query("CREATE TABLE toast_default (doc jsonb COMPRESSION lz4);")
+    a.query("INSERT INTO toast_low SELECT jsonb_build_object('sku', 'ABC-' || i, 'note', repeat('order line text ', 30), 'qty', i) "
+            "FROM generate_series(1, 1000) i;")
+    a.query("INSERT INTO toast_default SELECT doc FROM toast_low;")
+    a.equal("SELECT avg(pg_column_size(doc)) BETWEEN 400 AND 700, count(*) FILTER (WHERE pg_column_compression(doc) IS NOT NULL) "
+            "FROM toast_low;", 't|0')
+    a.equal("SELECT pg_relation_size('toast_low') = pg_relation_size('toast_default');")
+    a.query("INSERT INTO toast_low SELECT jsonb_build_object('note', repeat('order line text ', 160)) FROM generate_series(1, 100) i;")
+    a.equal("SELECT count(*) FROM toast_low WHERE pg_column_compression(doc) = 'lz4';", '100')
+    a.query('DROP TABLE toast_low, toast_default;')
+    print('PASS: toast_tuple_target cannot compress a row under the TOAST threshold', flush=True)
 
 
 def input_hygiene(a):
