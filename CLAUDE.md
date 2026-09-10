@@ -432,7 +432,10 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
   command line replaces the Makefile's `-lzstd`.
 - PostgreSQL betas on apt.postgresql.org live in the `<codename>-pgdg-testing`
   suite under the major's component (`Components: main 19`), not in the main
-  suite; `ci.yml` adds it for 19 until the release lands.
+  suite, and that suite is `NotAutomatic` (priority 100), so `apt-get install
+  -t <codename>-pgdg-testing` is needed or the main suite's `libpq5`/`libpq-dev`
+  18 block `postgresql-server-dev-19`; `ci.yml` does both for 19 until the
+  release lands.
 - `scan-build` fails silently under PGXS on macOS; run
   `clang --analyze` directly with the flags from `make -B -n ztype.o`.
 - **ASan runtimes before clang 18 on a recent kernel**: with 32 bits of mmap

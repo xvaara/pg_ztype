@@ -33,7 +33,10 @@ jobs:
             "$(. /etc/os-release; echo "$VERSION_CODENAME")" "${key:+Signed-By: $key}" \
             | sudo tee /etc/apt/sources.list.d/pgdg-testing.sources
           sudo apt-get update
-          sudo apt-get install -y postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libpq-dev libzstd-dev pkg-config
+          # The testing suite is NotAutomatic (priority 100): name it as the target release, or the
+          # main suite's libpq 18 wins and postgresql-server-dev-19 cannot be installed.
+          t=; [ "${{ matrix.pg }}" = 19 ] && t="-t $(. /etc/os-release; echo "$VERSION_CODENAME")-pgdg-testing"
+          sudo apt-get install -y $t postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libpq-dev libzstd-dev pkg-config
       - name: Build and test
         run: |
           export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
@@ -68,7 +71,8 @@ jobs:
             "$(. /etc/os-release; echo "$VERSION_CODENAME")" "${key:+Signed-By: $key}" \
             | sudo tee /etc/apt/sources.list.d/pgdg-testing.sources
           sudo apt-get update
-          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 postgresql-19 postgresql-server-dev-19 libpq-dev libzstd-dev pkg-config
+          # -t: the testing suite is NotAutomatic, see the matrix job.
+          sudo apt-get install -y -t "$(. /etc/os-release; echo "$VERSION_CODENAME")-pgdg-testing" postgresql-18 postgresql-server-dev-18 postgresql-19 postgresql-server-dev-19 libpq-dev libzstd-dev pkg-config
       - name: Cross-major (18 -> 19)
         run: |
           # Raw bytes both ways, logical dump/restore and pg_upgrade; builds both sides itself.
