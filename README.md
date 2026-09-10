@@ -2,6 +2,42 @@
 
 **zstd-compressed column types for PostgreSQL: `ztext`, `zjsonb`, `zbytea`.**
 
+## TL;DR
+
+Change a column's type and it takes a quarter of the space. Nothing else
+changes: the same `INSERT`, the same `SELECT`, the same `->>`, the same
+dumps and replication.
+
+- **Small values finally compress.** PostgreSQL never compresses a value
+  that fits in its row, so a table of 0.6 kB JSON documents is stored
+  uncompressed whatever `default_toast_compression` says. `zjsonb` compresses
+  every value, and with a trained dictionary the same table stores at **24%**
+  of `jsonb`'s size; large documents that TOAST already compresses drop to
+  **51%** ([the numbers](#what-it-saves-and-what-it-costs)).
+- **Dictionaries, built in.** `ztype.train_and_add('name', 'SELECT ...')`
+  trains a zstd dictionary from your own data and registers it; a column
+  declared `ztext(6, 'name')` uses it. Dictionaries are permanent, dumped
+  with the database and replicated to standbys, so old data stays readable.
+- **It behaves like the base type.** Literals, parameters, `COPY`, `pg_dump`,
+  logical replication and the binary protocol all carry plain `text`,
+  `jsonb` or `bytea`. Equality, `GROUP BY`, `DISTINCT`, hash joins and hash
+  indexes work on the column; jsonb reading operators and GIN indexes work
+  on `zjsonb`. Compression is a per-column policy in the type modifier, and
+  every row in the column has it.
+- **Operationally boring.** Restores need no settings, a missing dictionary
+  degrades to a warning rather than an error, every stored value carries a
+  checksum, `ztype.validate` sweeps a table, and `ztype-sync` carries the
+  dictionary registry between databases. Tested on PostgreSQL 18 and 19 with
+  a functional suite, replication and failover suites, a cross-major upgrade
+  suite, a mutation fuzzer and sanitizer builds.
+
+The trade: every read of a compressed value decompresses it, about 1 µs per
+small document with a dictionary and 3 µs without, so wide scans of small
+values are slower than plain `jsonb`, and content with nothing shared between
+rows saves little. The rest of this document says where the line is.
+
+## Why
+
 PostgreSQL compresses large values in TOAST with pglz or lz4, and that is the
 whole menu: the method is not extensible, and values that fit in a row,
 roughly anything under 2 kB, are never compressed at all. pg_ztype adds three
