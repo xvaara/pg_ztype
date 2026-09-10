@@ -2,10 +2,14 @@
 # staged-installation check, make test-install), plus the replication qualification
 # (make test-replication, and make test-replication-ha for promotion, failover slots and
 # pg_createsubscriber) and a smoke run of every benchmark (make bench-smoke) on Linux, a Linux
-# build with the undefined-behaviour sanitizer, on both platforms an AddressSanitizer run of the
+# build with the undefined-behaviour sanitizer (gcc: its libubsan is shared and gets linked into
+# the module; clang's UBSan runtime is static on Linux and a module built with it fails to load
+# with an undefined __ubsan_handle_* symbol), on both platforms an AddressSanitizer run of the
 # mutation harness (make test-asan) and on Linux the functional suite under the same sanitized build
 # (make test-asan-suite; macOS cannot, see CLAUDE.md), and a Linux cross-major run (make test-cross)
-# with 18 and 19 installed side by side. The suites create their own clusters.
+# with 18 and 19 installed side by side. The suites create their own clusters. PostgreSQL 19 is a
+# beta: apt.postgresql.org keeps betas and release candidates in the -pgdg-testing suite under the
+# major's own component, which pgdg_testing adds; drop it once 19 is in the main component.
 name: ci
 on:
   push:
@@ -14,6 +18,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         pg: [18, 19]
     steps:
@@ -21,6 +26,13 @@ jobs:
       - name: Install PostgreSQL ${{ matrix.pg }} and libzstd
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          key=$(cat /etc/apt/sources.list.d/pgdg.sources /etc/apt/sources.list.d/pgdg.list 2>/dev/null \
+                | sed -n -e 's/^Signed-By: //p' -e 's/.*signed-by=\([^] ]*\).*/\1/p' | head -1)
+          [ -n "$key" ] || key=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: %s-pgdg-testing\nComponents: main 19\n%s\n' \
+            "$(. /etc/os-release; echo "$VERSION_CODENAME")" "${key:+Signed-By: $key}" \
+            | sudo tee /etc/apt/sources.list.d/pgdg-testing.sources
+          sudo apt-get update
           sudo apt-get install -y postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libpq-dev libzstd-dev pkg-config
       - name: Build and test
         run: |
@@ -49,6 +61,13 @@ jobs:
       - name: Install PostgreSQL 18 and 19 and libzstd
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          key=$(cat /etc/apt/sources.list.d/pgdg.sources /etc/apt/sources.list.d/pgdg.list 2>/dev/null \
+                | sed -n -e 's/^Signed-By: //p' -e 's/.*signed-by=\([^] ]*\).*/\1/p' | head -1)
+          [ -n "$key" ] || key=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: %s-pgdg-testing\nComponents: main 19\n%s\n' \
+            "$(. /etc/os-release; echo "$VERSION_CODENAME")" "${key:+Signed-By: $key}" \
+            | sudo tee /etc/apt/sources.list.d/pgdg-testing.sources
+          sudo apt-get update
           sudo apt-get install -y postgresql-18 postgresql-server-dev-18 postgresql-19 postgresql-server-dev-19 libpq-dev libzstd-dev pkg-config
       - name: Cross-major (18 -> 19)
         run: |
@@ -58,14 +77,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install PostgreSQL 18, libzstd and clang
+      - name: Install PostgreSQL 18 and libzstd
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 libpq-dev libzstd-dev pkg-config clang
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 libpq-dev libzstd-dev pkg-config
       - name: Build with UBSan and test
         run: |
           export PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
-          make CC=clang PG_CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all" PG_LDFLAGS="-fsanitize=undefined"
+          # gcc: the shared libubsan is linked into the module (see the header comment).
+          make PG_CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all" PG_LDFLAGS="-fsanitize=undefined"
           make test
   linux-asan:
     runs-on: ubuntu-24.04

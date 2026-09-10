@@ -423,9 +423,16 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
 - Rebuilding `ztype.dylib` while a harness cluster (bench, cross-major) has it
   mapped can crash that cluster; build sanitizer or experimental variants in
   a copy of the tree, as `tests/test_cross_major.py` does.
-- Sanitizer builds: `make CC=clang PG_CFLAGS="-fsanitize=undefined
-  -fno-sanitize-recover=all" PG_LDFLAGS="-fsanitize=undefined"`; passing
-  `SHLIB_LINK` on the command line replaces the Makefile's `-lzstd`.
+- UBSan builds: `make PG_CFLAGS="-fsanitize=undefined
+  -fno-sanitize-recover=all" PG_LDFLAGS="-fsanitize=undefined"`, with
+  `CC=clang` on macOS and gcc on Linux: clang's Linux UBSan runtime is a
+  static archive that never reaches a shared module, so the module fails to
+  load with `undefined symbol: __ubsan_handle_...` (first CI run,
+  2026-09-10); gcc links its shared libubsan. Passing `SHLIB_LINK` on the
+  command line replaces the Makefile's `-lzstd`.
+- PostgreSQL betas on apt.postgresql.org live in the `<codename>-pgdg-testing`
+  suite under the major's component (`Components: main 19`), not in the main
+  suite; `ci.yml` adds it for 19 until the release lands.
 - `scan-build` fails silently under PGXS on macOS; run
   `clang --analyze` directly with the flags from `make -B -n ztype.o`.
 - **ASan runtimes before clang 18 on a recent kernel**: with 32 bits of mmap
