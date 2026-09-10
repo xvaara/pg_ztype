@@ -468,7 +468,7 @@ by. Levels up to 9 stay under 15 MB whatever the value.
 ## Compression policy
 
 The type modifier is `(level [, dictionary])`: levels 1–22; the dictionary is
-a slot number 0–65535 or the **name** of a registered dictionary, as a quoted
+a slot number 0–33554431 or the **name** of a registered dictionary, as a quoted
 string or a bare identifier. Slot zero means no dictionary; no modifier means
 `(6,0)` for values written as literals, parameters, `COPY` or casts from the
 base type — but a column declared without a modifier stores a value moved from
@@ -706,10 +706,25 @@ CREATE TABLE archive (body ztext(6, 'mail-2024'));
   committed fixture under `tests/fixtures/`), and libzstd `zstd_compiled`
   against `zstd_runtime`. `ztype.zstd_version()` is the runtime alone.
 
-Slots are 1–65535, allocated under a lock and never reused. `UPDATE`, `DELETE`
-and `TRUNCATE` on the registry are blocked, also under
+Slots are 1–33554431, allocated under a lock and never reused. `UPDATE`,
+`DELETE` and `TRUNCATE` on the registry are blocked, also under
 `session_replication_role = replica`. An administrator can still bypass that
 by changing the schema; doing so can make stored values unreadable.
+
+The slot field is not the practical ceiling, and it is not meant to invite one
+dictionary per tenant. A frame names its dictionary by zstd's 32-bit
+dictionary ID, which the registry requires to be unique, and that ID is a hash
+of the dictionary bytes: by the birthday bound two independently trained
+dictionaries collide with probability about 1 % at 10,000 of them and 39 % at
+65,535. On one node a collision is a retry — retrain and the bytes, and so the
+ID, differ — but two nodes that each already store rows under a colliding ID
+cannot be merged without rewriting a table. Add to that the registry itself
+(a dictionary is up to 1 MB, replicated, and `user_catalog_table = true` means
+a logical slot's `catalog_xmin` holds back vacuum on it) and the per-backend
+dictionary cache, which is a budget of a few entries: a workload spreading
+reads over many dictionaries pays the cold-load cost in
+[Request latency](#request-latency) on every statement. Plan for order 10⁴
+dictionaries across a fleet, one per corpus rather than one per customer.
 
 Ordinary roles read and write compressed columns without any access to the
 registry: the codec entry points run as the extension owner with a fixed
@@ -1066,7 +1081,7 @@ SELECT schema_name, table_name, column_name, level, slot
 ```
 
 The view decodes `pg_attribute.atttypmod` (`& 31` is the level, `>> 5 &
-65535` the slot, bit 21 the pending mark; `-1` means `(6,0)`) and joins the
+33554431` the slot, bit 30 the pending mark; `-1` means `(6,0)`) and joins the
 slot to the inventory. Drop the `WHERE` clause to see every column of the
 three types and the dictionary name each slot currently resolves to.
 

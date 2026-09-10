@@ -235,12 +235,16 @@ def check(cluster, work):
         a.query('SET session_replication_role = replica;')
         a.query('DELETE FROM ztype.dictionaries;', error='append-only')
         a.query('RESET session_replication_role;')
-        a.query("INSERT INTO ztype.dictionaries SELECT 65536,dict_id,'bad',dict,NULL,now() FROM ztype.dictionaries LIMIT 1;", error='check constraint')
-        a.query("SELECT 'x'::ztext(6,65536);", error='slot must be 0..65535')
-        a.query('CREATE TABLE wide(body ztext(3,65535));')
-        a.equal("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'wide'::regclass AND attname = 'body';", 'ztext(3,65535)')
+        a.query("INSERT INTO ztype.dictionaries SELECT 33554432,dict_id,'bad',dict,NULL,now() FROM ztype.dictionaries LIMIT 1;", error='check constraint')
+        a.query("SELECT 'x'::ztext(6,33554432);", error='slot must be 0..33554431')
+        a.query('CREATE TABLE wide(body ztext(3,33554431));')
+        a.equal("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'wide'::regclass AND attname = 'body';", 'ztext(3,33554431)')
         out = a.query("INSERT INTO wide SELECT repeat('wide slot ', 20); SELECT (ztype.inspect(body)).level FROM wide;")
-        assert 'slot 65535 is not available' in out and out.endswith('3'), out
+        assert 'slot 33554431 is not available' in out and out.endswith('3'), out
+        # The widest modifier the encoding can hold: top level, top slot and the pending bit
+        # (bit 30). It must stay a positive int32 and print back exactly.
+        a.query('CREATE TABLE widest(body ztext(22,33554431,pending));')
+        a.equal("SELECT atttypmod > 0, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'widest'::regclass AND attname = 'body';", 't|ztext(22,33554431,pending)')
         a.query("SELECT 'x'::ztext(0);", error='expected')
         a.query("SELECT 'x'::ztext(6,1,2);", error='expected')
         a.query("SELECT text_to_ztext('x',8192,false);", error='invalid type modifier')
@@ -661,7 +665,7 @@ def deferred_policy(a, work, env):
     trigger conditions are rewritten in place so their Vars keep matching the column; views and
     extended statistics are refused. README: "Changing the policy without a rewrite"."""
     lit = 'first sample subject ' * 20
-    pending92 = 9 | (2 << 5) | (1 << 21)
+    pending92 = 9 | (2 << 5) | (1 << 30)
     a.query(f"CREATE TABLE deferred(id integer PRIMARY KEY, body ztext(6,'first') DEFAULT '{lit}', n integer, CHECK (raw_length(body) < 100000));")
     a.query("CREATE FUNCTION deferred_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN NEW.n := 1; RETURN NEW; END';")
     a.query('CREATE TRIGGER deferred_t BEFORE INSERT OR UPDATE OF body ON deferred FOR EACH ROW WHEN (raw_length(NEW.body) > 0) EXECUTE FUNCTION deferred_trg();')
@@ -715,7 +719,7 @@ def deferred_policy(a, work, env):
     a.query("SELECT ztype.set_column_policy('deferred', 'missing', 3);", error='does not exist')
     a.query("SELECT ztype.set_column_policy('deferred', 'body', 3, 'missing');", error='not registered')
     a.query("SELECT ztype.set_column_policy('deferred', 'body', 0);", error='level 1..22')
-    a.query("SELECT ztype.set_column_policy('deferred', 'body', 3, 65536);", error='slot must be 0..65535')
+    a.query("SELECT ztype.set_column_policy('deferred', 'body', 3, 33554432);", error='slot must be 0..33554431')
     a.query("CREATE VIEW deferred_v AS SELECT body FROM deferred; SELECT ztype.set_column_policy('deferred', 'body', 3);", error='view public.deferred_v depends on it')
     a.query("DROP VIEW deferred_v; CREATE STATISTICS deferred_s ON (body::text), id FROM deferred; SELECT ztype.set_column_policy('deferred', 'body', 3);", error='statistics object public.deferred_s depends on it')
     a.query('DROP STATISTICS deferred_s;')
@@ -1437,16 +1441,16 @@ def backups(cluster, work):
 
 
 # Every ztext/zjsonb/zbytea column whose modifier names a slot this database does not have.
-# atttypmod & 31 is the level and (atttypmod >> 5) & 65535 the slot (bit 21 is the pending
+# atttypmod & 31 is the level and (atttypmod >> 5) & 33554431 the slot (bit 30 is the pending
 # flag); -1 means (6,0). README: "Recovery".
 UNREGISTERED_SLOTS = """
-SELECT c.relname, a.attname, a.atttypmod & 31 AS level, (a.atttypmod >> 5) & 65535 AS slot
+SELECT c.relname, a.attname, a.atttypmod & 31 AS level, (a.atttypmod >> 5) & 33554431 AS slot
   FROM pg_attribute a
   JOIN pg_class c ON c.oid = a.attrelid
   JOIN pg_type t ON t.oid = a.atttypid
-  LEFT JOIN ztype.dictionary_inventory d ON d.slot = (a.atttypmod >> 5) & 65535
+  LEFT JOIN ztype.dictionary_inventory d ON d.slot = (a.atttypmod >> 5) & 33554431
  WHERE t.typname IN ('ztext','zjsonb','zbytea') AND a.attnum > 0 AND NOT a.attisdropped
-   AND c.relkind IN ('r','p','m') AND a.atttypmod <> -1 AND (a.atttypmod >> 5) & 65535 > 0 AND d.slot IS NULL
+   AND c.relkind IN ('r','p','m') AND a.atttypmod <> -1 AND (a.atttypmod >> 5) & 33554431 > 0 AND d.slot IS NULL
  ORDER BY 1, 2"""
 
 

@@ -152,8 +152,12 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
   A soft error inside `zt_decompress`'s `PG_TRY` sets a flag and breaks; it
   never returns from there, so `PG_FINALLY` still releases the context. With an
   `escontext` set, `zt_decompress` neither reads nor seeds the decode cache.
-- **Typmod** encodes `level | slot << 5` with 16 slot bits, plus bit 21
-  (`ZT_TM_PENDING`, 22 bits total); `-1` means `(6,0)`. Names are resolved to
+- **Typmod** encodes `level | slot << 5` with 25 slot bits (bits 5-29), plus
+  bit 30 (`ZT_TM_PENDING`); `-1` means `(6,0)`. Bit 31 stays clear, so every
+  modifier is a positive int32 and `zt_policy` validates only the sign and the
+  level range. Widened from 16 slot bits on 2026-09-10, before release and so
+  without an update script: the slot never leaves the catalog (the frame names
+  a dictionary by its zstd ID), so no stored byte changed. Names are resolved to
   slots in `ztext_typmod_in` and only the slot is ever stored, so `typmod_out`
   must stay numeric or dumps stop restoring; the pending bit prints as a third
   element, `(9,2,pending)`, and `typmod_in` accepts exactly that word there.
@@ -218,9 +222,15 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
   support function that skipped the coercion for column references was tried
   and removed (2026-09-08) because CTEs, CASE and explicit casts leaked
   through it.
-- **Registry** (`ztype.dictionaries`) is append-only, slots 1–65535 never
+- **Registry** (`ztype.dictionaries`) is append-only, slots 1–33554431 never
   reused, names unique and never all digits. Registered dictionaries are
-  permanent because frames reference them by zstd dictionary ID. It is
+  permanent because frames reference them by zstd dictionary ID. That ID is
+  32 bits and unique in the registry, so it, not the slot field, is the real
+  ceiling on dictionary count: independently trained dictionaries collide by
+  the birthday bound (about 1 % at 10,000, 39 % at 65,535), recoverably on one
+  node and not at all between two that already store rows under the colliding
+  ID. README "The registry" documents the order-10⁴ design point;
+  do not widen the slot field again in the belief that it buys more. It is
   declared `WITH (user_catalog_table = true)`: logical decoding runs a
   published value's output function under a historic snapshot, which sees only
   rows written by transactions marked as catalog-changing, so without the

@@ -249,7 +249,7 @@ CREATE OPERATOR CLASS zbytea_hash_ops DEFAULT FOR TYPE zbytea USING hash AS
 CREATE FUNCTION ztype.dict_id(bytea) RETURNS bigint
   AS 'MODULE_PATHNAME', 'zstd_dict_id' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE TABLE ztype.dictionaries (
-  slot integer PRIMARY KEY CHECK (slot BETWEEN 1 AND 65535),
+  slot integer PRIMARY KEY CHECK (slot BETWEEN 1 AND 33554431),
   dict_id bigint UNIQUE NOT NULL CHECK (dict_id > 0 AND dict_id <= 4294967295),
   -- Names are typmod-addressable, so they must be unique and never all digits.
   name text NOT NULL UNIQUE CHECK (name <> '' AND name !~ '^[0-9]+$'),
@@ -285,14 +285,14 @@ CREATE VIEW ztype.column_policies AS
   SELECT n.nspname AS schema_name, c.relname AS table_name, a.attname AS column_name,
          t.typname AS type_name, a.atttypmod <> -1 AS has_modifier,
          CASE WHEN a.atttypmod = -1 THEN 6 ELSE a.atttypmod & 31 END AS level,
-         CASE WHEN a.atttypmod = -1 THEN 0 ELSE (a.atttypmod >> 5) & 65535 END AS slot,
-         a.atttypmod <> -1 AND (a.atttypmod >> 21) & 1 = 1 AS pending,
+         CASE WHEN a.atttypmod = -1 THEN 0 ELSE (a.atttypmod >> 5) & 33554431 END AS slot,
+         a.atttypmod <> -1 AND (a.atttypmod >> 30) & 1 = 1 AS pending,
          d.name AS dict_name, d.dict_id
     FROM pg_catalog.pg_attribute a
     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
-    LEFT JOIN ztype.dictionary_inventory d ON a.atttypmod <> -1 AND (a.atttypmod >> 5) & 65535 > 0 AND d.slot = (a.atttypmod >> 5) & 65535
+    LEFT JOIN ztype.dictionary_inventory d ON a.atttypmod <> -1 AND (a.atttypmod >> 5) & 33554431 > 0 AND d.slot = (a.atttypmod >> 5) & 33554431
    WHERE t.typname IN ('ztext', 'zjsonb', 'zbytea')
      AND t.typnamespace = (SELECT extnamespace FROM pg_catalog.pg_extension WHERE extname = 'ztype')
      AND a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'p', 'm');
@@ -368,8 +368,8 @@ BEGIN
   PERFORM ztype.dict_id(dict);
   LOCK TABLE ztype.dictionaries IN SHARE ROW EXCLUSIVE MODE;
   SELECT coalesce(max(slot), 0) + 1 INTO s FROM ztype.dictionaries;
-  IF s > 65535 THEN
-    RAISE EXCEPTION 'ztype: all 65535 dictionary slots are occupied' USING ERRCODE = '54000';
+  IF s > 33554431 THEN
+    RAISE EXCEPTION 'ztype: all 33554431 dictionary slots are occupied' USING ERRCODE = '54000';
   END IF;
   INSERT INTO ztype.dictionaries (slot, dict_id, name, dict, trained_from)
   VALUES (s, ztype.dict_id(dict), name, dict, trained_from);
@@ -415,8 +415,8 @@ BEGIN
   IF slot IS NULL OR name IS NULL OR dict IS NULL THEN
     RAISE EXCEPTION 'ztype: dictionary slot, name and bytes are required' USING ERRCODE = '22004';
   END IF;
-  IF slot < 1 OR slot > 65535 THEN
-    RAISE EXCEPTION 'ztype: dictionary slot must be between 1 and 65535' USING ERRCODE = '22023';
+  IF slot < 1 OR slot > 33554431 THEN
+    RAISE EXCEPTION 'ztype: dictionary slot must be between 1 and 33554431' USING ERRCODE = '22023';
   END IF;
   IF name = '' OR name ~ '^[0-9]+$' THEN
     RAISE EXCEPTION 'ztype: dictionary name must not be empty or all digits' USING ERRCODE = '22023';

@@ -72,8 +72,8 @@ PG_MODULE_MAGIC;
 #define ZT_JSONB_FORMAT 1
 #define ZT_LEVEL 6
 #define ZT_MAX_LEVEL 22
-#define ZT_MAX_SLOT 65535 /* typmod carries 16 slot bits above the 5 level bits */
-#define ZT_TM_PENDING (1 << 21) /* typmod bit above the slot: stored rows may still carry an older policy */
+#define ZT_MAX_SLOT 33554431 /* typmod carries 25 slot bits above the 5 level bits */
+#define ZT_TM_PENDING (1 << 30) /* typmod bit above the slot: stored rows may still carry an older policy */
 #define ZT_MIN_COMPRESS 64 /* shorter values are always stored raw */
 #define ZT_CHUNK (256 * 1024) /* codec input per interrupt check */
 #define ZT_DECODE_STEP (1024 * 1024) /* decoded bytes per interrupt check, at the frame's average ratio */
@@ -592,7 +592,7 @@ zt_dictionary(int slot, unsigned id, bool missing_ok, Node *escontext)
     return d;
 }
 
-/* One canonical typmod encoding: 5 level bits, 16 slot bits and the pending bit; -1 means
+/* One canonical typmod encoding: 5 level bits, 25 slot bits and the pending bit (bit 30); -1 means
  * (6,0). The pending bit is not part of the policy a write applies: it only records that
  * the column was re-pointed without a rewrite (ztype.set_column_policy) and rows written
  * before that may still carry the earlier policy. Every write and every coercion treats
@@ -604,7 +604,7 @@ zt_policy(int32 tm, int *level, int *slot)
     if (tm == -1) tm = ZT_LEVEL;
     *level = tm & 31;
     *slot = (tm >> 5) & ZT_MAX_SLOT;
-    if (tm < 0 || (tm >> 22) != 0 || *level < 1 || *level > ZT_MAX_LEVEL)
+    if (tm < 0 || *level < 1 || *level > ZT_MAX_LEVEL)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("ztype: invalid type modifier")));
 }
 
