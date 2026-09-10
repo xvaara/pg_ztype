@@ -88,7 +88,7 @@ section names below refer to it.
   differences.
 - Documented and tested procedures for restore catch-up, registry export and
   import, slot collisions, slot ranges for two-way setups, cascading,
-  failover slots, promotion and `pg_createsubscriber` ("Recovery",
+  failover slots, promotion and `pg_createsubscriber` ("Moving the registry",
   "Replication").
 
 ### Tests and benchmarks

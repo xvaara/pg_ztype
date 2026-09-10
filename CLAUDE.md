@@ -10,6 +10,7 @@ changes the code. Keep it short and keep it true.
 |---|---|
 | `ztype.c` | the whole extension: envelope, codec, dictionary cache, typmod, coercion, binary I/O, inspect, training |
 | `ztype--0.9.sql` | types (each with its `typanalyze`), casts (including the same-type coercion), operators (the key accessors in C, the other jsonb reading operators as inlinable SQL over the cast so an index on the cast expression still matches), the hash operator classes, the `ztype` schema, registry table, the inventory and column-policy views, the `policy_differences` sweep, admin functions |
+| `NOTES.md` | development notes: benchmark methodology and full result tables, the replication procedures in full, and what each test suite asserts. README.md summarises it and links to it |
 | `ztype.control` | extension metadata; `default_version` is the release knob. `ZT_VERSION` in `ztype.c` must match it: `build_info()` reports it and the suite compares it with `pg_extension.extversion` |
 | `.github/workflows/ci.yml` | Linux (PG 18 and 19: `test`, `test-install`, `test-replication`, `test-replication-ha`, `bench-smoke` with the output kept as an artifact), Linux 18→19 `test-cross`, Linux/UBSan, Linux ASan (fuzzer, then `test-asan-suite`), macOS (`test`, `test-install`, ASan fuzzer) |
 | `tools/ztype-sync` | the registry transport, stdlib Python over `psql`; `make install` ships a built copy (`SCRIPTS_built`, top-level `ztype-sync`, gitignored) next to `psql`. Reads bytes only on the source, writes only `ztype.import_dictionary` calls plus the `policy_differences` sweep in one target transaction |
@@ -75,7 +76,7 @@ refuses to alter existing ones under the same magic); the suite failing on
 it otherwise is the point of it. Rerun `make bench` and update the README tables
 when the codec changes, and `make bench-latency` (README "Request latency")
 when the registry lookup or the dictionary cache changes, `make bench-rewrite`
-(README "What a rewrite costs") when the coercion or what a rewrite writes per
+(NOTES.md "What a rewrite costs") when the coercion or what a rewrite writes per
 row changes, `make bench-memory` (README "Working memory") when codec
 parameters, contexts or the dictionary objects change, and `make bench-hash`
 (README "Equality, grouping and joins") when `zt_equal`, `zt_hash`, the decode
@@ -391,7 +392,9 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
   problems are `ERRCODE_DATA_CORRUPTED`, unknown formats
   `ERRCODE_FEATURE_NOT_SUPPORTED`, missing objects `ERRCODE_UNDEFINED_OBJECT`.
 - Keep README.md the single user-facing document and keep it accurate:
-  a claim that was not measured or tested here does not go in.
+  a claim that was not measured or tested here does not go in. Full result
+  tables, methodology and the test inventory go to NOTES.md; the README
+  quotes the numbers a user needs to decide and links there.
 
 ## Gotchas that have already cost time
 
@@ -405,7 +408,7 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
 - `add_dictionary` allocates `max(slot) + 1` over the whole registry, so a
   node that has imported another node's high slot allocates inside that
   node's range next. That is why two-way setups register with explicit slots
-  through `import_dictionary` on both sides (README "Slot ranges"; `twoway`
+  through `import_dictionary` on both sides (NOTES.md "Slot ranges"; `twoway`
   in the suite pins the pitfall with a rolled-back `train_and_add`).
 - A published relation must exist on the subscriber before any row for it is
   decoded, refreshed or not: the apply worker resolves the remote name
