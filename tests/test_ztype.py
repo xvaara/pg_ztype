@@ -312,6 +312,7 @@ def check(cluster, work):
         dict_report(cluster)
         parameter_shapes(a)
         input_hygiene(a)
+        plain_reads(a)
         out = a.query("SELECT (decode('00','hex')::ztext)::text;", error='storage format')
         assert 'spike' not in out, out  # the hint names no project-internal history
         a.query("SELECT raw_length(decode('00','hex')::ztext);", error='storage format')
@@ -429,6 +430,31 @@ def delegation(cluster, a):
     finally:
         s.close()
         d.close()
+
+
+def plain_reads(a):
+    """The README's first example: a column selected as it is prints the decoded value and compares
+    against a literal without a cast, and the assignment casts move it into a base-type column; the
+    cast is what a base-type function or operator needs, and the result column's type otherwise
+    stays the compressed one."""
+    a.query("CREATE TABLE plain_reads(body ztext(6), meta zjsonb(6), payload zbytea(6), copy_of text);")
+    a.query("""INSERT INTO plain_reads VALUES ('hello world', '{"source": "email"}', '\\x0000ff', NULL);""")
+    a.equal("SELECT body, meta, payload FROM plain_reads;", 'hello world|{"source": "email"}|\\x0000ff')
+    a.equal("SELECT pg_typeof(body), pg_typeof(body::text), pg_typeof(meta::jsonb), pg_typeof(payload::bytea) FROM plain_reads;",
+            'ztext|text|jsonb|bytea')
+    a.equal("""SELECT body = 'hello world', meta = '{"source":"email"}', payload = '\\x0000ff', meta ->> 'source' FROM plain_reads;""",
+            't|t|t|email')
+    a.query("UPDATE plain_reads SET copy_of = body;")  # assignment cast, no ::text needed
+    a.equal("SELECT copy_of = body::text FROM plain_reads;")
+    a.equal("SELECT length(body::text), body::text LIKE 'hello%', jsonb_typeof(meta::jsonb), octet_length(payload::bytea) FROM plain_reads;",
+            '11|t|object|3')
+    for sql, missing in (("SELECT length(body) FROM plain_reads;", 'function length(ztext) does not exist'),
+                         ("SELECT body LIKE 'hello%' FROM plain_reads;", 'operator does not exist: ztext ~~ unknown'),
+                         ("SELECT jsonb_typeof(meta) FROM plain_reads;", 'function jsonb_typeof(zjsonb) does not exist'),
+                         ("SELECT octet_length(payload) FROM plain_reads;", 'function octet_length(zbytea) does not exist')):
+        a.query(sql, error=missing)
+    a.query('DROP TABLE plain_reads;')
+    print('PASS: plain reads and literal comparisons need no cast; base-type functions do', flush=True)
 
 
 def input_hygiene(a):

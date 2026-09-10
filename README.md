@@ -22,6 +22,13 @@ INSERT INTO messages VALUES ('hello', '{"source": "email"}', '\x0000ff');
 SELECT body::text, metadata ->> 'source', payload::bytea FROM messages;
 ```
 
+Selecting a column as it is prints the decoded value too, and `body = 'hello'`
+compares against a literal without a cast: the cast is what gives a client a
+`text`, `jsonb` or `bytea` result type instead of `ztext`, and what the base
+type's functions and operators (`length`, `LIKE`, `jsonb_typeof`, `ORDER BY`)
+need, since the compressed types carry none of them
+(see [What is native, what needs a cast](#what-is-native-what-needs-a-cast)).
+
 On a mix of small ERP-style JSON documents, `zjsonb` with a dictionary stores
 **a quarter of what `jsonb` needs**. Measurements, and the cases where it is a
 bad trade, are below.
