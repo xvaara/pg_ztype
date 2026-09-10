@@ -1,0 +1,15 @@
+# PGXS build artefacts
+*.o
+*.so
+*.dylib
+*.dll
+*.bc
+*.plist
+results/
+__pycache__/
+build/
+
+# personal, per-machine guidance
+CLAUDE.local.md
+CLAUDE.local.*.md
+/ztype-sync

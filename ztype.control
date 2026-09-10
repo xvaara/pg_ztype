@@ -1,0 +1,5 @@
+comment = 'zstd-compressed column types: ztext, zjsonb, zbytea'
+default_version = '0.9'
+module_pathname = '$libdir/ztype'
+relocatable = false
+schema = 'public'

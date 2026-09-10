@@ -1,0 +1,103 @@
+# Build and test on Linux against PostgreSQL 18 and 19 and on macOS against 18 (make test and the
+# staged-installation check, make test-install), plus the replication qualification
+# (make test-replication, and make test-replication-ha for promotion, failover slots and
+# pg_createsubscriber) and a smoke run of every benchmark (make bench-smoke) on Linux, a Linux
+# build with the undefined-behaviour sanitizer, on both platforms an AddressSanitizer run of the
+# mutation harness (make test-asan) and on Linux the functional suite under the same sanitized build
+# (make test-asan-suite; macOS cannot, see CLAUDE.md), and a Linux cross-major run (make test-cross)
+# with 18 and 19 installed side by side. The suites create their own clusters.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        pg: [18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL ${{ matrix.pg }} and libzstd
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libpq-dev libzstd-dev pkg-config
+      - name: Build and test
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make
+          make test
+          # The files make install ships, staged under a scratch DESTDIR and loaded from there.
+          make test-install
+          # Publisher, logical subscriber, physical standby and a third node, all created by the
+          # harness; then promotion, a failover slot and pg_createsubscriber on four more.
+          make test-replication
+          make test-replication-ha
+          # Every benchmark at tiny sizes: proves they still run, measures nothing.
+          make bench-smoke
+      - name: Keep the smoke-run output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke-pg${{ matrix.pg }}
+          path: results/bench/
+          if-no-files-found: ignore
+  linux-cross:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 18 and 19 and libzstd
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 postgresql-19 postgresql-server-dev-19 libpq-dev libzstd-dev pkg-config
+      - name: Cross-major (18 -> 19)
+        run: |
+          # Raw bytes both ways, logical dump/restore and pg_upgrade; builds both sides itself.
+          make test-cross PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config NEW_PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
+  linux-ubsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 18, libzstd and clang
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 libpq-dev libzstd-dev pkg-config clang
+      - name: Build with UBSan and test
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          make CC=clang PG_CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all" PG_LDFLAGS="-fsanitize=undefined"
+          make test
+  linux-asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 18, libzstd and clang
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 libpq-dev libzstd-dev pkg-config clang
+      - name: AddressSanitizer mutation harness
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          # A sanitized module is preloaded into a stock server; the harness proves the runtime is
+          # live (positive control) and fails on any report that implicates ztype's own code.
+          make test-asan ASAN_CC=clang MUTATE_ARGS="--iterations 600"
+          # The functional suite under the same build (many errors per backend: Linux only).
+          make test-asan-suite ASAN_CC=clang
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 18 and libzstd
+        run: brew install postgresql@18 zstd pkg-config
+      - name: Build and test
+        run: |
+          export PG_CONFIG="$(brew --prefix postgresql@18)/bin/pg_config"
+          export PATH="$(brew --prefix postgresql@18)/bin:$PATH"
+          make
+          make test
+          make test-install
+      - name: AddressSanitizer mutation harness
+        run: |
+          export PG_CONFIG="$(brew --prefix postgresql@18)/bin/pg_config"
+          export PATH="$(brew --prefix postgresql@18)/bin:$PATH"
+          make test-asan ASAN_CC=clang MUTATE_ARGS="--iterations 400"

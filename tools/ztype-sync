@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Carry a ztype dictionary registry from one database to another, and report policy differences.
+
+    ztype-sync --source CONNINFO --target CONNINFO [--dry-run | --check] [--psql PATH]
+
+Logical replication and dump/restore never carry a compressed frame: the receiving side compresses
+again under its own column modifier, so it needs the publisher's dictionaries under the same slots
+before name-based DDL, and a slot that means a different dictionary there is applied silently. This
+tool is the transport. It reads both registries' public inventory (slot, name, zstd dictionary ID),
+treats every source dictionary whose ID is already registered on the target, under any slot, as
+present, fetches the bytes of the others from the source once, and registers them on the target
+through ztype.import_dictionary, one transaction for all of them: a collision (SQLSTATE 42710, the
+slot or the name taken by another dictionary) rolls the whole batch back and the target registry is
+untouched. The same transaction then runs the subscriber-side sweep, ztype.policy_differences, with
+the source's column_policies, and every column whose level or dictionary differs is printed.
+
+Privileges follow the documented model and add nothing: the source role must be able to read the
+dictionary bytes (the extension owner or a superuser); the target role needs EXECUTE on
+ztype.import_dictionary and nothing else. The bytes travel hex-encoded in the SQL text on the
+target connection and appear nowhere else: not in arguments, not in files, not in this program's
+output. What this program cannot prevent is a target with log_statement = 'all', which logs the
+statement text.
+
+Modes: the default run imports and sweeps; --dry-run does the same and rolls the transaction back,
+so the verdict, the sweep included, is the server's on what the run would have left; --check
+imports nothing and only reports. Exit codes: 0 in sync (nothing to import, or imported and no
+policy difference); 1 a collision refused the import, nothing written; 2 policy differences remain
+(imports, if any, are committed); 3 usage, connection, privilege or psql failure. Connection
+details come from the two conninfo strings (a service=... entry keeps passwords out of the command
+line, which is visible to other users).
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+
+IN_SYNC, COLLISION, DIFFERENCES, FAILURE = 0, 1, 2, 3
+
+
+class Failure(Exception):
+    pass
+
+
+def psql(path, conninfo, sql, stdin=None):
+    """One psql run: unaligned, quiet, stopping on the first error, verbose enough that stderr
+    carries the SQLSTATE. Query results come back one row per line on stdout."""
+    args = [path, '-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose', '-d', conninfo]
+    if stdin is None:
+        args += ['-c', sql]
+    env = dict(os.environ, PGCLIENTENCODING='UTF8')
+    try:
+        return subprocess.run(args, input=stdin, env=env, capture_output=True, text=True)
+    except OSError as e:
+        raise Failure(f'cannot run {path}: {e}')
+
+
+def sqlstate(result):
+    m = re.search(r'^(?:psql:[^:]*:\d+: )?ERROR:\s+([0-9A-Z]{5}):\s+(.*)$', result.stderr, re.M)
+    return (m.group(1), m.group(2)) if m else (None, result.stderr.strip() or f'psql exited with {result.returncode}')
+
+
+def rows(path, conninfo, sql, side):
+    """Run a query whose single column is row_to_json(...) and return the decoded rows."""
+    result = psql(path, conninfo, sql)
+    if result.returncode != 0:
+        code, message = sqlstate(result)
+        raise Failure(f'{side}: {message}' if code is None else f'{side}: {code}: {message}')
+    return [json.loads(line) for line in result.stdout.splitlines() if line]
+
+
+def inventory(path, conninfo, side):
+    version = rows(path, conninfo, "SELECT row_to_json(e) FROM (SELECT extversion FROM pg_extension WHERE extname = 'ztype') e", side)
+    if not version:
+        raise Failure(f'{side}: the ztype extension is not installed in this database')
+    return rows(path, conninfo, 'SELECT row_to_json(i) FROM (SELECT slot, name, dict_id FROM ztype.dictionary_inventory ORDER BY slot) i', side)
+
+
+def fetch(path, conninfo, slots):
+    """The bytes of the given source slots, one JSON document per line through COPY ... TO STDOUT.
+    row_to_json emits no raw control characters, so COPY's text escaping only doubles backslashes."""
+    sql = ('COPY (SELECT row_to_json(d) FROM (SELECT slot, name, encode(dict, \'hex\') AS dict, trained_from '
+           f'FROM ztype.dictionaries WHERE slot IN ({",".join(str(int(s)) for s in slots)}) ORDER BY slot) d) TO STDOUT')
+    result = psql(path, conninfo, sql)
+    if result.returncode != 0:
+        code, message = sqlstate(result)
+        hint = ' (connect to the source as the extension owner or a superuser)' if code == '42501' else ''
+        raise Failure(f'source: {code}: {message}{hint}' if code else f'source: {message}')
+    return [json.loads(line.replace('\\\\', '\\')) for line in result.stdout.splitlines() if line]
+
+
+def policies(path, conninfo):
+    return rows(path, conninfo, "SELECT row_to_json(j) FROM (SELECT coalesce(jsonb_agg(p), '[]'::jsonb) AS p "
+                                'FROM ztype.column_policies p) j', 'source')[0]['p']
+
+
+def quoted(value, tag):
+    if value is None:
+        return 'NULL::text'
+    if tag in value:
+        raise Failure('dollar-quote tag collides with the payload; run again')
+    return f'${tag}${value}${tag}$'
+
+
+def apply(path, conninfo, dicts, source_policies, commit):
+    """One target transaction: register every fetched dictionary through ztype.import_dictionary
+    (the server decides collisions, never this program), then sweep the columns against the
+    source's policies, then COMMIT or ROLLBACK. Returns (sqlstate, message, differences)."""
+    tag = 'zs' + secrets.token_hex(8)
+    script = ['BEGIN;']
+    for d in dicts:
+        script.append(f"SELECT ztype.import_dictionary({int(d['slot'])}, {quoted(d['name'], tag)}, "
+                      f"decode('{d['dict']}', 'hex'), {quoted(d['trained_from'], tag)});")
+    script.append(f"SELECT row_to_json(d) FROM (SELECT * FROM ztype.policy_differences({quoted(json.dumps(source_policies), tag)}::jsonb) "
+                  'ORDER BY schema_name, table_name, column_name) d;')
+    script.append('COMMIT;' if commit else 'ROLLBACK;')
+    result = psql(path, conninfo, None, stdin='\n'.join(script) + '\n')
+    if result.returncode != 0:
+        code, message = sqlstate(result)
+        if code == '42710':
+            return code, message, []
+        raise Failure(f'target: {code}: {message}' if code else f'target: {message}')
+    lines = [line for line in result.stdout.splitlines() if line]
+    expected = [str(int(d['slot'])) for d in dicts]
+    if lines[:len(dicts)] != expected:
+        raise Failure(f'target: import_dictionary returned {lines[:len(dicts)]}, expected {expected}')
+    return None, None, [json.loads(line) for line in lines[len(dicts):]]
+
+
+def describe(d, side):
+    if d[f'{side}_dict_id'] is None:
+        return f"level {d[f'{side}_level']}, slot {d[f'{side}_slot']}, no dictionary"
+    return f"level {d[f'{side}_level']}, {d[f'{side}_dict_name']!r} ID {d[f'{side}_dict_id']}"
+
+
+def sync(args):
+    source = inventory(args.psql, args.source, 'source')
+    target = inventory(args.psql, args.target, 'target')
+    by_id = {int(t['dict_id']): t for t in target}
+    by_slot = {int(t['slot']): t for t in target}
+    pending = []
+    for s in source:
+        here = by_id.get(int(s['dict_id']))
+        if here is not None:
+            where = '' if (int(here['slot']), here['name']) == (int(s['slot']), s['name']) else f" (here slot {here['slot']} {here['name']!r})"
+            print(f"present slot {s['slot']} {s['name']!r}{where}")
+            continue
+        pending.append(s)
+        if args.check:
+            taken = by_slot.get(int(s['slot']))
+            if taken is None:
+                print(f"missing slot {s['slot']} {s['name']!r} ID {s['dict_id']}")
+            else:
+                print(f"different slot {s['slot']}: here {taken['name']!r} ID {taken['dict_id']}, source {s['name']!r} ID {s['dict_id']}")
+    dicts = [] if args.check or not pending else fetch(args.psql, args.source, [s['slot'] for s in pending])
+    code, message, diffs = apply(args.psql, args.target, dicts, policies(args.psql, args.source), commit=not (args.check or args.dry_run))
+    if code:
+        print(f'ERROR: {code}: {message}', file=sys.stderr)
+        print('nothing written: the target registry is untouched', file=sys.stderr)
+        return COLLISION
+    verb = 'would import' if args.dry_run else 'imported'
+    for d in dicts:
+        print(f"{verb} slot {d['slot']} {d['name']!r}")
+    for d in diffs:
+        print(f"{d['schema_name']}.{d['table_name']}.{d['column_name']}: {d['difference']} "
+              f"(here {describe(d, 'local')}; source {describe(d, 'publisher')})")
+    if diffs or (args.check and pending):
+        return DIFFERENCES
+    print('in sync' + (' (dry run)' if args.dry_run and dicts else ''))
+    return IN_SYNC
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='ztype-sync', description=__doc__.split('\n\n')[1],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog='exit codes: 0 in sync, 1 collision (nothing written), 2 differences remain, 3 failure')
+    parser.add_argument('--source', required=True, help='conninfo of the database whose registry is carried (must read the bytes)')
+    parser.add_argument('--target', required=True, help='conninfo of the database that receives it (EXECUTE on ztype.import_dictionary)')
+    parser.add_argument('--psql', default='psql', help='psql executable (default: psql on PATH)')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run', action='store_true', help='import and sweep inside a transaction that is rolled back')
+    mode.add_argument('--check', action='store_true', help='import nothing; report missing dictionaries and policy differences')
+    args = parser.parse_args(argv)
+    try:
+        return sync(args)
+    except Failure as e:
+        print(f'ztype-sync: {e}', file=sys.stderr)
+        return FAILURE
+
+
+if __name__ == '__main__':
+    sys.exit(main())
