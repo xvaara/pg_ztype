@@ -476,3 +476,38 @@ REVOKE ALL ON FUNCTION ztype.dict_id(bytea),
   ztype.reload_dictionaries(), ztype.add_dictionary(text, bytea, text),
   ztype.import_dictionary(integer, text, bytea, text),
   ztype.train_and_add(text, text, integer) FROM PUBLIC;
+
+-- Compressed output pass-through: the stored zstd frame without the envelope, always exactly
+-- one frame (a raw-stored value is encoded at level 1 per call), for a client that decodes
+-- zstd itself or forwards the bytes as Content-Encoding: zstd. Dictionary frames come back as
+-- stored unless portable, which decodes and re-encodes without the dictionary at level 1. The
+-- pass-through never decodes and never loads a dictionary; the content checksum is the
+-- client decoder's to verify. SECURITY DEFINER like the casts, for the portable path alone:
+-- a role that may decode a dictionary column may ask for a portable frame of it. No zjsonb
+-- overload by decision (its payload is PostgreSQL's binary jsonb): ztype.zstd(doc::text).
+CREATE FUNCTION ztype.zstd(ztext, portable boolean DEFAULT false) RETURNS bytea
+  AS 'MODULE_PATHNAME', 'ztext_zstd' LANGUAGE C STABLE STRICT PARALLEL SAFE COST 25 SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
+CREATE FUNCTION ztype.zstd(zbytea, portable boolean DEFAULT false) RETURNS bytea
+  AS 'MODULE_PATHNAME', 'zbytea_zstd' LANGUAGE C STABLE STRICT PARALLEL SAFE COST 25 SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
+-- Any base-type value as one dictionary-free frame at the given level, 1..22.
+CREATE FUNCTION ztype.zstd(text, level integer DEFAULT 1) RETURNS bytea
+  AS 'MODULE_PATHNAME', 'ztype_zstd_base' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 25;
+CREATE FUNCTION ztype.zstd(bytea, level integer DEFAULT 1) RETURNS bytea
+  AS 'MODULE_PATHNAME', 'ztype_zstd_base' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 25;
+-- The zstd dictionary ID a stored frame names, NULL when it names none; envelope and frame
+-- header only, so an application can key a dictionary cache on it before fetching the frame.
+CREATE FUNCTION ztype.dictionary_id(ztext) RETURNS bigint
+  AS 'MODULE_PATHNAME', 'ztext_dictionary_id' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION ztype.dictionary_id(zbytea) RETURNS bigint
+  AS 'MODULE_PATHNAME', 'zbytea_dictionary_id' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+-- The dictionary bytes by ID, NULL when the ID is not registered, so a client fetches each
+-- dictionary once. SECURITY INVOKER by decision (2026-09-12): the bytes can contain training
+-- data, so this reads the registry as the caller and hands them only to a role that holds
+-- SELECT on ztype.dictionaries; EXECUTE alone, and any definer wrapper, would be a new path
+-- to the bytes. Not granted to PUBLIC, like the other registry functions.
+CREATE FUNCTION ztype.dictionary(dict_id bigint) RETURNS bytea
+  LANGUAGE SQL STABLE STRICT PARALLEL SAFE SECURITY INVOKER SET search_path = pg_catalog, pg_temp
+  BEGIN ATOMIC
+    SELECT dict FROM ztype.dictionaries d WHERE d.dict_id = dictionary.dict_id;
+  END;
+REVOKE ALL ON FUNCTION ztype.dictionary(bigint) FROM PUBLIC;

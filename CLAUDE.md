@@ -17,6 +17,7 @@ changes the code. Keep it short and keep it true.
 | `tests/test_ztype.py` | the suite; stdlib only, spins its own cluster (`Cluster`, `share`), `make test` |
 | `tests/test_install.py` | `make install` into a scratch `DESTDIR`, the staged file set, the shipped control file loaded through `dynamic_library_path`, `CREATE`/`DROP EXTENSION`, `make uninstall`; `make test-install` |
 | `tests/pq_params.c` | libpq extended-protocol parameters, compiled and run by the suite |
+| `tests/zstd_output.c` | libzstd-only client decoder for the pass-through frames (frame, dictionary, expected bytes as files; prints the frame's dictionary ID), compiled and run by the suite |
 | `tests/test_cross_major.py` | two installations: raw bytes both ways, dump/restore, `pg_upgrade` |
 | `tests/test_replication.py` | publisher with `wal_level = logical`, logical subscriber (also publishing: cascading to a third cluster, two-way with `origin = none`), `pg_basebackup` standby, the tool as the seeding step, and the registry-collision runbook; `make test-replication` |
 | `tests/test_replication_ha.py` | failover and promotion on its own port block: a standby with `sync_replication_slots` promoted by `pg_promote`, a `failover = true` subscription repointed to it, and `pg_createsubscriber` on a second base backup; imports the helpers of `test_replication.py`; `make test-replication-ha` |
@@ -282,6 +283,30 @@ rather than as a defect. Cases are `seed:index`, so a failure replays with
   dry run is the same transaction rolled back), reads bytes only on the source
   as a role that already may, never on the target, and otherwise reads the two
   PUBLIC views. It never picks a slot and never removes or overwrites a row.
+- **Compressed output is pass-through, and output only** (2026-09-12).
+  `ztype.zstd(ztext | zbytea [, portable])` returns the stored frame without
+  the envelope after `zt_header` and the structural frame check (`zt_frame_id`,
+  which loads no dictionary and verifies no checksum: that is the client
+  decoder's job), always as one frame: a raw-stored value is encoded at level 1
+  per call through `zt_compress_internal(frame_only = true)`, which is the
+  storage codec with the raw fallback and the 64-byte floor turned off. Only
+  the `portable` path decodes (through the strict lookup) and re-encodes
+  without the dictionary, and that path is why the two wrappers are
+  `SECURITY DEFINER` like the casts. `ztype.zstd(text | bytea, level)` is the
+  form for every base type and the documented way to send `zjsonb`
+  (`doc::text`); no `zjsonb` overload by decision, its payload being the
+  binary container. `ztype.dictionary_id` reads a TOAST slice like
+  `matches_policy`. `ztype.dictionary(id)` is `SECURITY INVOKER` and not
+  granted to `PUBLIC` by decision: it reads the registry as the caller, so the
+  bytes reach only a role holding `SELECT` on `ztype.dictionaries`, which keeps
+  the rule that no function hands out dictionary bytes on its own privilege;
+  `output_frames` in the suite pins `EXECUTE` alone as `42501`. There is no
+  input side, by decision: every server-side check (the content checksum, the
+  `ztext` encoding check, and for `zjsonb` a container walk the server does
+  not do today) needs the decoded bytes, so accepting client frames would
+  either decode anyway or store unvalidated bytes. The suite's independent
+  decoder is `tests/zstd_output.c`, and the mutation harness runs the three
+  readers as operations.
 - **Training samples are stored bytes** (text, bytea or jsonb varlena
   slices). Rejecting the compressed types as training input is deliberate.
 - **Parallel safety.** Everything that only reads the registry through SPI

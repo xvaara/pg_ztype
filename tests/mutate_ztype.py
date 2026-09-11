@@ -66,7 +66,8 @@ def op_expected(case_expect, opname):
         return 'error' if full else 'any'
     if case_expect == 'kindmismatch':
         # Only fixed-kind decoders must reject; recompress and the coercion honour the stored byte.
-        return 'error' if (opname in ('decode', 'output', 'send', 'arrow', 'arrow_text') or opname.startswith('prefix')) else 'any'
+        return 'error' if (opname in ('decode', 'output', 'send', 'arrow', 'arrow_text', 'zstd', 'zstd_portable', 'dictionary_id')
+                           or opname.startswith('prefix')) else 'any'
     return 'any'                # 'raw' and 'any': no checksum or no guarantee
 
 
@@ -338,6 +339,9 @@ def ops_for(case, rng, work, item_level, item_slot):
             ops.append((f'prefix({n})', f'SELECT octet_length(prefix(({{V}}), {n}));'))
     if kind in ('ztext', 'zbytea'):
         ops.append(('raw_length', 'SELECT raw_length(({V}));'))
+        ops.extend([('zstd', 'SELECT octet_length(ztype.zstd(({V})));'),
+                    ('zstd_portable', 'SELECT octet_length(ztype.zstd(({V}), true));'),
+                    ('dictionary_id', 'SELECT ztype.dictionary_id(({V}));')])
     ops.append(('inspect', 'SELECT i.* FROM ztype.inspect(({V})) i;'))
     ops.append(('coerce_same', f'SELECT pg_column_size(({{V}})::{kind}({item_level},{item_slot}));'))
     level, slot = rng.choice([l for l in (1, 3, 6, 9, 19) if l != item_level]), rng.choice([s for s in (0, 1, 2, 3) if s != item_slot])

@@ -796,7 +796,20 @@ the count and clearing the mark after the batched catch-up, partitions
 through the parent, views, statistics, non-owners and partitions refused, an
 `ALTER COLUMN TYPE` out of the pending state, and a pending column through
 plain and parallel dumps), `ztype.build_info`
-against `pg_extension` and the fixture's magic, backend RSS across
+against `pg_extension` and the fixture's magic, the compressed output
+pass-through (every `ztext` and `zbytea` fixture value, raw, compressed,
+dictionary and out of line, plus an incompressible value of each type, returned
+by `ztype.zstd` with the backend's dictionary load counter unmoved and decoded
+by a separate libzstd client, `tests/zstd_output.c`;
+compressed fixture bytes equal to the returned frame minus the envelope; the
+portable form naming no dictionary; the base-type form at two levels, on an
+empty value, and refusing levels outside 1 to 22; no `zjsonb` overload;
+`ztype.dictionary_id` against `ztype.inspect`; `ztype.dictionary` returning
+the fixture's bytes to the owner and refusing a role with `EXECUTE` alone
+until it holds `SELECT` on the registry; a corrupt frame header refused by
+both readers; and a frame whose content checksum was corrupted passed through
+byte for byte, after the intact one decoded with the same files, and rejected
+by the client on the checksum, as by the server's own decode), backend RSS across
 commits, aborts, savepoint rollbacks, codec errors and a cancelled level-22
 compression, plain and parallel logical restores without settings, and a
 non-UTF8 database encoding. Recovery has its own section: registry export

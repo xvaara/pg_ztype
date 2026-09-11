@@ -189,6 +189,52 @@ CREATE INDEX messages_metadata ON messages USING gin ((metadata::jsonb));
 
 All codec functions, casts and accessors are `PARALLEL SAFE`.
 
+### Compressed output pass-through
+
+A client that decodes zstd itself, or that forwards the bytes to a browser
+as `Content-Encoding: zstd`, can read a stored value as a zstd frame instead
+of having the server decode it:
+
+```sql
+SELECT ztype.zstd(body) FROM messages WHERE id = $1;         -- ztext or zbytea
+SELECT ztype.zstd(body, true) FROM messages WHERE id = $1;   -- portable: no dictionary
+SELECT ztype.zstd(metadata::text) FROM messages WHERE id = $1;   -- zjsonb, rendered first
+```
+
+The contract is one frame, always, so the client needs one code path and no
+branch:
+
+- **`ztype.zstd(value)`** on `ztext` and `zbytea` returns the stored frame
+  exactly as it is, without the 16-byte envelope. A value stored raw (under
+  64 bytes, or one zstd could not shrink) is encoded at level 1 on each call.
+  The server runs its envelope and frame-header checks and nothing else: it
+  does not decode, does not load a dictionary, and does not verify the
+  content checksum. That check is your decoder's job: libzstd does it in its
+  default configuration, and so does every decoder built on it unless told
+  to skip it. `ztext` bytes are in the database encoding.
+- **Dictionary frames come back as stored**, and a browser cannot decode
+  them. A client that holds the dictionary decodes them as they are:
+  `ztype.dictionary_id(value)` reads the dictionary ID from the frame header
+  (NULL for a frame without one, and for a raw value) without fetching the
+  whole of an out-of-line value, and `ztype.dictionary(id)` returns the bytes once, for
+  the client to cache. That function reads `ztype.dictionaries` as the
+  caller, so it needs `SELECT` on the registry and `EXECUTE` on the function;
+  dictionary bytes can contain training data, and no other function returns
+  them.
+- **`ztype.zstd(value, true)`** decodes a dictionary frame and re-encodes it
+  without the dictionary at level 1, so a browser can read it. It costs a
+  decode plus an encode per call, and on small values it gives up most of
+  what the dictionary saved. Frames without a dictionary pass through as
+  before.
+- **`ztype.zstd(text, level)`** and **`ztype.zstd(bytea, level)`** compress
+  any base-type value at the given level (1 to 22, default 1). There is no
+  `zjsonb` form: its payload is PostgreSQL's binary jsonb, of no use to a
+  client, so send `ztype.zstd(doc::text)` and pay the render and the encode
+  where the call shows them.
+
+This is output only. There is no way to send compressed bytes into the
+server, by decision: every check the server makes needs the decoded value.
+
 ## What it saves, and what it costs
 
 Measured with `make bench` (PostgreSQL 18.6, libzstd 1.5.7, Apple M1 Pro,

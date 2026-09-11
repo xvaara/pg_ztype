@@ -715,10 +715,13 @@ ztext_typmod_out(PG_FUNCTION_ARGS)
 
 /* Compress with a zstd content checksum, retaining raw bytes when compression saves
  * no space. Logical writes (strict = false) tolerate a slot that is not visible yet;
- * explicit recompression does not.
+ * explicit recompression does not. frame_only is the output pass-through's mode: no
+ * 64-byte floor and no raw fallback, the result is always one frame (the bound is
+ * ZSTD_compressBound, which every input fits), and a value too large for that bound
+ * is an error instead of a raw envelope.
  */
 static ZtValue *
-zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
+zt_compress_internal(const char *src, Size len, int32 tm, uint8 kind, bool strict, bool frame_only)
 {
     int level, slot;
     size_t bound;
@@ -734,7 +737,11 @@ zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
         dict = zt_dictionary(slot, 0, !strict, NULL); /* even for tiny values, so a bad slot surfaces early */
     bound = ZSTD_compressBound(len);
     if (ZSTD_isError(bound) || bound > MaxAllocSize - ZT_HDR)
+    {
+        if (frame_only)
+            ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("ztype: frame is too large")));
         bound = len; /* large values can still use the raw representation */
+    }
     v = palloc(ZT_HDR + bound);
     v->magic = ZT_MAGIC;
     v->rawlen = len;
@@ -742,7 +749,7 @@ zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
     v->level = level;
     v->kind = kind;
     v->codec = ZT_RAW;
-    if (len >= ZT_MIN_COMPRESS && bound > len)
+    if (frame_only || (len >= ZT_MIN_COMPRESS && bound > len))
     {
         if (dict && (!dict->cd || dict->level != level))
         {
@@ -797,6 +804,8 @@ zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
                     break;
                 }
             }
+            if (frame_only && !fits) /* cannot happen at ZSTD_compressBound; never label raw bytes a frame */
+                ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("ztype: frame exceeds the compression bound")));
             written = fits ? out.pos : len;
         }
         PG_FINALLY();
@@ -804,7 +813,7 @@ zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
             ZSTD_freeCCtx(ctx);
         }
         PG_END_TRY();
-        if (written < len) v->codec = ZT_ZSTD;
+        if (frame_only || written < len) v->codec = ZT_ZSTD;
     }
     if (v->codec == ZT_RAW)
     {
@@ -813,6 +822,13 @@ zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
     }
     SET_VARSIZE(v, ZT_HDR + written);
     return v;
+}
+
+/* Storage keeps its raw fallback; output frames use the same codec without it. */
+static ZtValue *
+zt_compress(const char *src, Size len, int32 tm, uint8 kind, bool strict)
+{
+    return zt_compress_internal(src, len, tm, kind, strict, false);
 }
 
 /* One-entry decode cache. A query that reads several keys of one zjsonb row, or
@@ -906,26 +922,49 @@ zt_header(ZtValue *v, uint8 kind, Node *escontext)
     return true;
 }
 
-/* Validate exactly one complete zstd frame with a matching declared length. Returns the
- * frame's dictionary, or NULL when it names none; with an ErrorSaveContext a NULL can
- * also mean a rejected frame, which the caller separates with SOFT_ERROR_OCCURRED.
+/* The frame header alone: zstd's magic, a declared content size equal to the envelope's
+ * and the content checksum flag. Needs no more of the payload than
+ * ZSTD_FRAMEHEADERSIZE_MAX bytes, so it also runs on a TOAST slice.
  */
-static ZtDict *
-zt_frame(ZtValue *v, Node *escontext)
+static bool
+zt_frame_header(ZtValue *v, Node *escontext)
 {
     Size len = VARSIZE(v) - ZT_HDR;
-    unsigned id;
-    size_t frame_size;
     if (len < 5 || memcmp(v->data, "\x28\xb5\x2f\xfd", 4) != 0 ||
         ZSTD_getFrameContentSize(v->data, len) != v->rawlen ||
         !((unsigned char) v->data[4] & 4)) /* require content checksum */
-        ereturn(escontext, NULL, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("ztype: invalid frame header")));
+        ereturn(escontext, false, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("ztype: invalid frame header")));
+    return true;
+}
+
+/* Structural check of exactly one complete zstd frame over the whole payload: the header
+ * above, then the block chain walked to the frame's end, which must be the stored end.
+ * Returns the dictionary ID the frame names, zero for none; loads no dictionary and
+ * verifies no checksum (only a decode does). With an ErrorSaveContext a zero can also mean
+ * a rejected frame, which the caller separates with SOFT_ERROR_OCCURRED.
+ */
+static unsigned
+zt_frame_id(ZtValue *v, Node *escontext)
+{
+    Size len = VARSIZE(v) - ZT_HDR;
+    size_t frame_size;
+    if (!zt_frame_header(v, escontext))
+        return 0;
     frame_size = ZSTD_findFrameCompressedSize(v->data, len);
     if (!zt_check_soft(frame_size, escontext))
-        return NULL;
+        return 0;
     if (frame_size != len)
-        ereturn(escontext, NULL, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("ztype: unexpected trailing frame data")));
-    id = ZSTD_getDictID_fromFrame(v->data, len);
+        ereturn(escontext, 0, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("ztype: unexpected trailing frame data")));
+    return ZSTD_getDictID_fromFrame(v->data, len);
+}
+
+/* Decoders additionally resolve the dictionary strictly, after structural validation. */
+static ZtDict *
+zt_frame(ZtValue *v, Node *escontext)
+{
+    unsigned id = zt_frame_id(v, escontext);
+    if (SOFT_ERROR_OCCURRED(escontext))
+        return NULL;
     return id ? zt_dictionary(0, id, false, escontext) : NULL;
 }
 
@@ -1222,6 +1261,98 @@ Datum zbytea_out(PG_FUNCTION_ARGS)
 {
     bytea *b = (bytea *) zt_decompress((ZtValue *) PG_GETARG_VARLENA_P(0), ZT_BYTEA, NULL);
     PG_RETURN_DATUM(DirectFunctionCall1(byteaout, PointerGetDatum(b)));
+}
+
+/* Compressed output pass-through, ztype.zstd(value [, portable]): the stored zstd frame
+ * without the envelope, for a client that decodes zstd itself or forwards the bytes as
+ * Content-Encoding: zstd. The contract is "always one frame": a value stored raw (too
+ * short, or one zstd could not shrink) is encoded at level 1 per call, without a
+ * dictionary. A frame that names a dictionary is returned as stored, since a client
+ * holding the dictionary (ztype.dictionary_id and ztype.dictionary) decodes it as it is;
+ * with portable = true it is decoded and re-encoded at level 1 without one, so a browser
+ * can read it, at the cost of a decode plus an encode per call. The pass-through path
+ * runs the envelope and frame structure checks and nothing else: no dictionary is loaded
+ * and no content checksum verified, which is the client decoder's job. Only the portable
+ * path reads the registry, through the strict lookup in zt_decompress, and that is why the
+ * SQL wrappers are SECURITY DEFINER like the casts: an ordinary role may decode a
+ * dictionary column, so it may ask for a portable frame of it too. No zjsonb overload by
+ * decision: its payload decodes to PostgreSQL's binary jsonb, useless to a client, and
+ * ztype.zstd(doc::text) makes the render-and-encode cost visible in the call.
+ */
+static bytea *
+zt_output_frame(ZtValue *v, Size len)
+{
+    bytea *out = palloc(VARHDRSZ + len);
+    SET_VARSIZE(out, VARHDRSZ + len);
+    memcpy(VARDATA(out), v->data, len);
+    return out;
+}
+
+static Datum
+zt_zstd(FunctionCallInfo fcinfo, uint8 kind)
+{
+    ZtValue *v = (ZtValue *) PG_GETARG_VARLENA_P(0);
+    bool portable = PG_GETARG_BOOL(1);
+    zt_header(v, kind, NULL);
+    if (v->codec == ZT_RAW)
+    {
+        if (VARSIZE(v) - ZT_HDR != v->rawlen)
+            ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("ztype: invalid raw value length")));
+        v = zt_compress_internal(v->data, v->rawlen, 1, kind, true, true);
+    }
+    else if (zt_frame_id(v, NULL) != 0 && portable)
+    {
+        struct varlena *raw = zt_decompress(v, kind, NULL);
+        v = zt_compress_internal(VARDATA(raw), VARSIZE(raw) - VARHDRSZ, 1, kind, true, true);
+    }
+    PG_RETURN_BYTEA_P(zt_output_frame(v, VARSIZE(v) - ZT_HDR));
+}
+
+PG_FUNCTION_INFO_V1(ztext_zstd);
+Datum ztext_zstd(PG_FUNCTION_ARGS) { return zt_zstd(fcinfo, ZT_TEXT); }
+PG_FUNCTION_INFO_V1(zbytea_zstd);
+Datum zbytea_zstd(PG_FUNCTION_ARGS) { return zt_zstd(fcinfo, ZT_BYTEA); }
+
+/* ztype.dictionary_id(value): the zstd dictionary ID the stored frame names, NULL for a
+ * frame without one and for a raw value. The envelope and the frame header only, like
+ * ztype.inspect, so an out-of-line value costs its first TOAST chunk: an application keys
+ * its dictionary cache on this before fetching the frame.
+ */
+static Datum
+zt_dictionary_id_of(FunctionCallInfo fcinfo, uint8 kind)
+{
+    ZtValue *v = (ZtValue *) PG_DETOAST_DATUM_SLICE(PG_GETARG_DATUM(0), 0, ZT_HDR - VARHDRSZ + ZSTD_FRAMEHEADERSIZE_MAX);
+    unsigned id;
+    zt_header(v, kind, NULL);
+    if (v->codec == ZT_RAW)
+        PG_RETURN_NULL();
+    zt_frame_header(v, NULL);
+    id = zt_frame_dict_id(v);
+    if (id == 0)
+        PG_RETURN_NULL();
+    PG_RETURN_INT64((int64) id);
+}
+
+PG_FUNCTION_INFO_V1(ztext_dictionary_id);
+Datum ztext_dictionary_id(PG_FUNCTION_ARGS) { return zt_dictionary_id_of(fcinfo, ZT_TEXT); }
+PG_FUNCTION_INFO_V1(zbytea_dictionary_id);
+Datum zbytea_dictionary_id(PG_FUNCTION_ARGS) { return zt_dictionary_id_of(fcinfo, ZT_BYTEA); }
+
+/* ztype.zstd(text | bytea, level): one dictionary-free frame of any base-type value at
+ * the given level, however short or incompressible the input. The documented way to send
+ * a zjsonb column: ztype.zstd(doc::text). Touches no registry, so it needs no definer.
+ */
+PG_FUNCTION_INFO_V1(ztype_zstd_base);
+Datum ztype_zstd_base(PG_FUNCTION_ARGS)
+{
+    struct varlena *raw = PG_GETARG_VARLENA_PP(0);
+    int level = PG_GETARG_INT32(1);
+    ZtValue *v;
+    if (level < 1 || level > ZT_MAX_LEVEL)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                        errmsg("ztype: expected a level 1..%d", ZT_MAX_LEVEL)));
+    v = zt_compress_internal(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw), level, ZT_BYTEA, true, true);
+    PG_RETURN_BYTEA_P(zt_output_frame(v, VARSIZE(v) - ZT_HDR));
 }
 
 /* Read only the envelope from TOAST; raw_length counts bytes, not characters. */

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1724,6 +1725,103 @@ def fixture_current(loaded, magic):
     return current[0]
 
 
+def output_frames(s, data, work):
+    """A separate libzstd client decodes every fixture, including raw and TOAST values."""
+    exe = work / 'zstd_output'
+    try:
+        flags = shlex.split(run(['pkg-config', '--cflags', '--libs', 'libzstd']))
+    except Exception:
+        flags = ['-lzstd']  # as the Makefile falls back
+    run(['cc', '-o', exe, ROOT / 'tests/zstd_output.c', *flags])
+    frame, dictionary, expected = [work / n for n in ('frame.bin', 'dictionary.bin', 'expected.bin')]
+    d = data['dictionary']
+    dictionary.write_bytes(bytes.fromhex(d['hex']))
+    s.equal(f"SELECT encode(ztype.dictionary({d['dict_id']}), 'hex') = '{d['hex']}';")
+    s.equal('SELECT ztype.dictionary(0) IS NULL;')
+    for v in data['values']:
+        if v['type'] == 'zjsonb':
+            continue
+        value = f"(SELECT v FROM fx_{v['type']} WHERE id = '{v['id']}')"
+        logical = f"convert_to(({v['sql']})::text, 'UTF8')" if v['type'] == 'ztext' else f"({v['sql']})::bytea"
+        expected.write_bytes(bytes.fromhex(s.query(f"SELECT encode({logical}, 'hex');")))
+        # The pass-through and the ID read neither decode nor touch the registry: with the cache
+        # flushed, the backend's dictionary load counter must not move, dictionary frames included.
+        s.query('SELECT ztype.reload_dictionaries();')
+        loads = s.query('SELECT loads FROM ztype.dictionary_cache_stats();')
+        s.equal(f'SELECT ztype.dictionary_id({value});', str(v['inspect']['dict_id'] or ''))
+        s.equal(f'SELECT octet_length(ztype.zstd({value})) > 0;')
+        s.equal('SELECT loads FROM ztype.dictionary_cache_stats();', loads)
+        for portable in ('false', 'true'):
+            h = s.query(f"SELECT encode(ztype.zstd({value}, {portable}), 'hex');")
+            frame.write_bytes(bytes.fromhex(h))
+            id_ = run([exe, frame, dictionary, expected])
+            assert id_ == str(0 if portable == 'true' else v['inspect']['dict_id'] or 0), v['id']
+            if v['inspect']['codec'] == 'zstd' and portable == 'false':
+                # Fixture bytes omit PostgreSQL's varlena header: the envelope here is 12 bytes.
+                assert h == v['hex'][24:], v['id']
+    for base, value, raw in [('text', "repeat('héllo',100)", ('héllo'*100).encode()),
+                             ('bytea', "decode('00ff8041','hex')", bytes.fromhex('00ff8041')),
+                             ('text', "''", b'')]:
+        expected.write_bytes(raw)
+        for level in (1, 9):
+            frame.write_bytes(bytes.fromhex(s.query(f"SELECT encode(ztype.zstd({value}::{base}, {level}), 'hex');")))
+            assert run([exe, frame, dictionary, expected]) == '0'
+    for level in (0, 23, -1, 2147483647):
+        s.query(f"SELECT ztype.zstd('x'::text, {level});", error='expected a level 1..22')
+    s.query("SELECT ztype.zstd('{}'::zjsonb);", error='does not exist')
+    # Ordinary roles can use portable output but cannot retrieve dictionary bytes, even
+    # after EXECUTE is delegated; only an additional registry SELECT grant permits it.
+    s.query('CREATE ROLE frame_reader; SET ROLE frame_reader;')
+    s.query(f"SELECT ztype.dictionary({d['dict_id']});", error='permission denied')
+    s.query('RESET ROLE; GRANT EXECUTE ON FUNCTION ztype.dictionary(bigint) TO frame_reader; SET ROLE frame_reader;')
+    s.query(f"SELECT ztype.dictionary({d['dict_id']});", error='permission denied')
+    s.query('RESET ROLE; GRANT SELECT ON ztype.dictionaries TO frame_reader; SET ROLE frame_reader;')
+    s.equal(f"SELECT encode(ztype.dictionary({d['dict_id']}), 'hex') = '{d['hex']}';")
+    s.query('RESET ROLE; REVOKE SELECT ON ztype.dictionaries FROM frame_reader;')
+    dv = next(v for v in data['values'] if v['type'] == 'ztext' and v['inspect']['dict_id'])
+    raw = RAW_IN['ztext'].format(h=dv['hex'])
+    expected.write_bytes(bytes.fromhex(s.query(f"SELECT encode(convert_to(({dv['sql']})::text, 'UTF8'), 'hex');")))
+    s.query('SET ROLE frame_reader;')
+    # The pass-through hands the role the frame as stored (decoding it needs the dictionary the role
+    # cannot fetch); the portable form decodes as the definer and comes back dictionary-free.
+    frame.write_bytes(bytes.fromhex(s.query(f"SELECT encode(ztype.zstd({raw}), 'hex');")))
+    assert run([exe, frame, dictionary, expected]) == str(dv['inspect']['dict_id'])
+    frame.write_bytes(bytes.fromhex(s.query(f"SELECT encode(ztype.zstd({raw}, true), 'hex');")))
+    assert run([exe, frame, expected, expected]) == '0'  # any bytes as the "dictionary": none is needed
+    s.query('RESET ROLE;')
+    # A value zstd could not shrink is stored raw and still comes out as one frame: random bytes,
+    # and 70 bytes of random printable text, above the 64-byte floor and incompressible.
+    noise = "(SELECT string_agg(decode(md5(i::text), 'hex'), '') FROM generate_series(1, 200) i)"
+    text_noise = "(SELECT string_agg(chr(33 + (get_byte(decode(md5(i::text), 'hex'), 0) % 94)), '') FROM generate_series(1, 70) i)"
+    for kind, expr, logical in (('zbytea', f'{noise}::zbytea', noise),
+                                ('ztext', f'{text_noise}::ztext', f"convert_to({text_noise}, 'UTF8')")):
+        s.equal(f"SELECT i.codec, i.raw_length FROM ztype.inspect({expr}) i;", 'raw|' + ('3200' if kind == 'zbytea' else '70'))
+        expected.write_bytes(bytes.fromhex(s.query(f"SELECT encode({logical}, 'hex');")))
+        frame.write_bytes(bytes.fromhex(s.query(f"SELECT encode(ztype.zstd({expr}), 'hex');")))
+        assert run([exe, frame, dictionary, expected]) == '0', kind
+        s.equal(f'SELECT ztype.dictionary_id({expr}) IS NULL;')
+    # A corrupt frame header is refused before anything is returned; a corrupt payload behind an
+    # intact header is passed through unread, and it is the client's decoder that rejects it on
+    # the content checksum, exactly as documented. The intact frame is decoded with the very same
+    # dictionary and expected files first, so the failure below can only be the corruption's.
+    expected.write_bytes(bytes.fromhex(s.query(f"SELECT encode(convert_to(({dv['sql']})::text, 'UTF8'), 'hex');")))
+    frame.write_bytes(bytes.fromhex(s.query(f"SELECT encode(ztype.zstd({raw}), 'hex');")))
+    assert run([exe, frame, dictionary, expected]) == str(dv['inspect']['dict_id'])
+    bad = bytearray.fromhex(dv['hex']); bad[12] = 0
+    bad_value = RAW_IN['ztext'].format(h=bad.hex())
+    for op in ('ztype.zstd', 'ztype.dictionary_id'):
+        s.query(f'SELECT {op}({bad_value});', error='invalid frame header')
+    torn = bytearray.fromhex(dv['hex']); torn[-1] ^= 0xff  # the last four bytes of a frame are its content checksum
+    torn_value = RAW_IN['ztext'].format(h=torn.hex())
+    frame.write_bytes(bytes.fromhex(s.query(f"SELECT encode(ztype.zstd({torn_value}), 'hex');")))
+    assert frame.read_bytes() == bytes(torn)[12:]  # passed through as stored, checksum and all
+    s.equal(f"SELECT ztype.dictionary_id({torn_value});", str(dv['inspect']['dict_id']))
+    client = subprocess.run([str(exe), str(frame), str(dictionary), str(expected)], capture_output=True, text=True)
+    assert client.returncode == 1 and 'checksum' in client.stderr, (client.returncode, client.stderr)
+    s.query(f'SELECT ({torn_value})::text;', error='checksum')  # the server's own decode does reject it
+    print('PASS: output frames independently decoded, pass-through bytes and dictionary privileges', flush=True)
+
+
 def fixtures(cluster):
     """Bytes stored by an earlier build must still decode, and retired magics must still be refused.
     test-cross builds both sides from today's source, so nothing else here would notice an
@@ -1796,6 +1894,7 @@ def fixtures(cluster):
                         f"(({v['sql']})::jsonb ->> k)) FROM jsonb_object_keys(({v['sql']})::jsonb) k;")
             else:
                 s.equal(f"SELECT raw_length({raw}) = {i['raw_length']};")
+        output_frames(s, data, Path(cluster.env['PGHOST']))
         assert toasted == set(BASE_TYPE), f'the fixture needs an out-of-line entry for every type, has {sorted(toasted)}'
         for kind in toasted:
             s.equal(f"SELECT pg_relation_size(reltoastrelid) > 0 FROM pg_class WHERE relname = 'fx_{kind}';")

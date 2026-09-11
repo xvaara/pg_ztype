@@ -33,6 +33,17 @@ section names below refer to it.
   malformed values through the caller's error context, so
   `pg_input_is_valid` and `COPY ... ON_ERROR ignore` work; the receive
   functions stay hard by decision.
+- Compressed output pass-through ("Compressed output pass-through" under
+  "The types"): `ztype.zstd(value [, portable])` on `ztext` and `zbytea`
+  returns the stored zstd frame without the envelope, always exactly one
+  frame (a raw-stored value is encoded at level 1 per call), dictionary
+  frames as stored or, with `portable`, re-encoded without the dictionary;
+  `ztype.zstd(text | bytea, level)` compresses any base-type value, which is
+  the form for `zjsonb` (`ztype.zstd(doc::text)`); `ztype.dictionary_id(value)`
+  reads the frame's dictionary ID from the header; `ztype.dictionary(id)`
+  returns the bytes to a role holding `SELECT` on the registry, as the
+  caller. Output side only: there is no client path for compressed bytes
+  into the server.
 - Requires PostgreSQL 18 or newer and libzstd 1.5 or newer.
 
 ### Compression policy
@@ -62,7 +73,8 @@ section names below refer to it.
   slot. Registration runs as the extension owner, so delegation is `EXECUTE`
   on the functions and nothing on the registry; training keeps caller
   privileges. Dictionary bytes are readable only through the registry table
-  itself, never through a function.
+  itself and `ztype.dictionary`, which reads it as the caller under the same
+  table privilege; no function hands them out on its own privilege.
 - `ztype.dictionary_inventory` (slot, name, ID, size, never the bytes) for
   comparing two registries; `ztype.dictionary_cache_size` as the one GUC, a
   budget per backend; `ztype.reload_dictionaries`,
